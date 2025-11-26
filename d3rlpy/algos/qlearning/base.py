@@ -7,6 +7,7 @@ from typing import (
     Optional,
     Sequence,
     TypeVar,
+    Union,
 )
 
 import numpy as np
@@ -14,6 +15,7 @@ import torch
 from torch import nn
 from tqdm.auto import tqdm, trange
 from typing_extensions import Self
+from concurrent.futures import ThreadPoolExecutor
 
 from ...base import ImplBase, LearnableBase, LearnableConfig, save_config
 from ...constants import (
@@ -519,6 +521,11 @@ class QLearningAlgoBase(
         # save hyperparameters
         save_config(self, logger)
 
+        # setup a background thread for sampling
+        # and prefetch the very first batch before the loop starts
+        executor = ThreadPoolExecutor(max_workers=1)
+        future_batch = executor.submit(self.sample_and_process, dataset=dataset)
+
         # training loop
         n_epochs = n_steps // n_steps_per_epoch
         total_step = 0
@@ -536,9 +543,8 @@ class QLearningAlgoBase(
                 with logger.measure_time("step"):
                     # pick transitions
                     with logger.measure_time("sample_batch"):
-                        batch = dataset.sample_transition_batch(
-                            self._config.batch_size
-                        )
+                        batch = future_batch.result()
+                        future_batch = executor.submit(self.sample_and_process, dataset=dataset)
 
                     # update parameters
                     with logger.measure_time("algorithm_update"):
@@ -856,7 +862,22 @@ class QLearningAlgoBase(
 
         return buffer
 
-    def update(self, batch: TransitionMiniBatch) -> dict[str, float]:
+    def sample_from_batch(self, batch: TransitionMiniBatch):
+        return TorchMiniBatch.from_batch(
+            batch=batch,
+            gamma=self._config.gamma,
+            compute_returns_to_go=self.need_returns_to_go,
+            device=self._device,
+            observation_scaler=self._config.observation_scaler,
+            action_scaler=self._config.action_scaler,
+            reward_scaler=self._config.reward_scaler,
+        )
+    
+    def sample_and_process(self, dataset: ReplayBufferBase):
+        batch = dataset.sample_transition_batch(self._config.batch_size)
+        return self.sample_from_batch(batch)
+
+    def update(self, batch: Union[TransitionMiniBatch, TorchMiniBatch]) -> dict[str, float]:
         """Update parameters with mini-batch of data.
 
         Args:
@@ -866,15 +887,12 @@ class QLearningAlgoBase(
             Dictionary of metrics.
         """
         assert self._impl, IMPL_NOT_INITIALIZED_ERROR
-        torch_batch = TorchMiniBatch.from_batch(
-            batch=batch,
-            gamma=self._config.gamma,
-            compute_returns_to_go=self.need_returns_to_go,
-            device=self._device,
-            observation_scaler=self._config.observation_scaler,
-            action_scaler=self._config.action_scaler,
-            reward_scaler=self._config.reward_scaler,
-        )
+        
+        if isinstance(batch, TorchMiniBatch):
+            torch_batch = batch
+        else:
+            torch_batch = self.sample_from_batch(batch=batch)
+
         loss = self._impl.update(torch_batch, self._grad_step)
         self._grad_step += 1
         return loss
